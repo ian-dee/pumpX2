@@ -97,7 +97,7 @@ public class IDPManagerTest {
                 "profiles=[" +
                     "IDPManager.Profile[" +
                         "idpSettingsResponse=IDPSettingsResponse[carbEntry=false,idpId=2,insulinDuration=200,maxBolus=20000,name=PROFILE2,numberOfProfileSegments=1,cargo={2,80,82,79,70,73,76,69,50,0,0,0,0,0,0,0,0,1,-56,0,32,78,0}]," +
-                        "isActiveProfile=false," +
+                        "isActiveProfile=true," +
                         "profileIndex=0," +
                         "segments=[" +
                             "IDPSegmentResponse[idpId=2,idpStatus=[BASAL_RATE, CARB_RATIO, TARGET_BG, CORRECTION_FACTOR, START_TIME],idpStatusId=31,profileBasalRate=500,profileCarbRatio=5,profileISF=1,profileProcessedStartTime=00:00,profileStartTime=0,profileTargetBG=100,segmentIndex=0,cargo={2,0,0,0,-12,1,5,0,0,0,100,0,1,0,31}]" +
@@ -114,7 +114,7 @@ public class IDPManagerTest {
                     "], " +
                     "IDPManager.Profile[" +
                         "idpSettingsResponse=IDPSettingsResponse[carbEntry=true,idpId=0,insulinDuration=300,maxBolus=25000,name=PROFILE0,numberOfProfileSegments=4,cargo={0,80,82,79,70,73,76,69,48,0,0,0,0,0,0,0,0,4,44,1,-88,97,1}]," +
-                        "isActiveProfile=true," +
+                        "isActiveProfile=false," +
                         "profileIndex=2," +
                         "segments=[" +
                             "IDPSegmentResponse[idpId=0,idpStatus=[BASAL_RATE, CARB_RATIO, TARGET_BG, CORRECTION_FACTOR, START_TIME],idpStatusId=31,profileBasalRate=500,profileCarbRatio=5,profileISF=1,profileProcessedStartTime=00:00,profileStartTime=0,profileTargetBG=100,segmentIndex=0,cargo={0,0,0,0,-12,1,5,0,0,0,100,0,1,0,31}], " +
@@ -125,5 +125,32 @@ public class IDPManagerTest {
                     "]" +
                 "]" +
             "]", idpManager.toString());
+    }
+
+    @Test
+    public void activeProfileUsesTheIdStoredInSlotZeroRatherThanTreatingItAsAnIndex() {
+        ProfileStatusResponse profileStatus = new ProfileStatusResponse(
+                4,
+                1,
+                3,
+                2,
+                0,
+                -1,
+                -1,
+                4
+        );
+        IDPManager manager = new IDPManager(profileStatus);
+
+        List.of(
+                new IDPSettingsResponse(1, "ACTIVE", 0, 300, 15_000, true),
+                new IDPSettingsResponse(3, "THREE", 0, 300, 15_000, true),
+                new IDPSettingsResponse(2, "TWO", 0, 300, 15_000, true),
+                new IDPSettingsResponse(0, "ZERO", 0, 300, 15_000, true)
+        ).forEach(manager::processMessage);
+
+        assertTrue(manager.isComplete());
+        assertEquals(1, manager.getActiveProfile().getIdpId());
+        assertTrue(manager.getProfileWithIdpId(1).orElseThrow().isActiveProfile());
+        assertFalse(manager.getProfileWithIdpId(3).orElseThrow().isActiveProfile());
     }
 }

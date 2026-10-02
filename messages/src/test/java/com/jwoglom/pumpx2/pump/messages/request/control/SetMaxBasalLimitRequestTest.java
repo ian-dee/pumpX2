@@ -30,11 +30,20 @@ public class SetMaxBasalLimitRequestTest {
         assertHexEquals(expected.getCargo(), parsedReq.getCargo());
     }
 
-    @Test(expected=IllegalArgumentException.class)
-    public void testSetMaxBasalLimitRequest_lt1u_invalid() throws DecoderException {
+    @Test
+    public void testSetMaxBasalLimitRequest_0_2u_valid() throws DecoderException {
         initPumpState(PacketArrayList.IGNORE_INVALID_HMAC, 0L);
 
-        new SetMaxBasalLimitRequest(100);
+        SetMaxBasalLimitRequest request = new SetMaxBasalLimitRequest(200);
+
+        assertHexEquals(SetMaxBasalLimitRequest.buildCargo(200), request.getCargo());
+    }
+
+    @Test(expected=IllegalArgumentException.class)
+    public void testSetMaxBasalLimitRequest_lt0_2u_invalid() throws DecoderException {
+        initPumpState(PacketArrayList.IGNORE_INVALID_HMAC, 0L);
+
+        new SetMaxBasalLimitRequest(199);
     }
 
     @Test(expected=IllegalArgumentException.class)

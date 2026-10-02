@@ -1,7 +1,5 @@
 package com.jwoglom.pumpx2.pump.bluetooth;
 
-import static com.welie.blessed.BluetoothBytesParser.asHexString;
-
 import android.annotation.SuppressLint;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
@@ -151,6 +149,26 @@ public class TandemBluetoothHandler {
     private final Set<ConnectionInitializationStep> remainingConnectionInitializationSteps = new HashSet<>();
     private final Set<UUID> remainingCharacteristicNotificationsInit = new HashSet<>();
     private final Map<String, PumpReadyState> pumpReadyStateByAddress = new HashMap<>();
+    private boolean mobiAuthorizationNotificationReady = false;
+    private boolean mobiPostBondNotificationsConfigured = false;
+    private static final long MIN_RECONNECT_DELAY_MS = 250L;
+    private static final long MAX_RECONNECT_DELAY_MS = 30_000L;
+    private static final long FOREGROUND_STALE_CONNECTION_MS = 20_000L;
+    private static final long BACKGROUND_STALE_CONNECTION_MS = 6 * 60_000L;
+    private static final long STALE_CONNECTION_RESTART_DELAY_MS = 1_000L;
+    private boolean stopped = false;
+    private boolean reconnectScheduled = false;
+    private boolean scanActive = false;
+    private long reconnectDelayMs = MIN_RECONNECT_DELAY_MS;
+    private long connectionAttemptStartedAtMs = 0L;
+    @Nullable private BluetoothPeripheral connectionAttemptPeripheral = null;
+
+    private final Runnable reconnectRunnable = () -> {
+        synchronized (TandemBluetoothHandler.this) {
+            reconnectScheduled = false;
+        }
+        ensureConnectionActiveInternal(false, "scheduled retry");
+    };
 
     static Set<QualifyingEvent> normalizeQualifyingEvents(Set<QualifyingEvent> rawEvents) {
         Set<QualifyingEvent> normalizedEvents = new TreeSet<>(rawEvents);
@@ -161,9 +179,77 @@ public class TandemBluetoothHandler {
     }
 
     private synchronized void resetRemainingConnectionInitializationSteps() {
+        remainingConnectionInitializationSteps.clear();
+        remainingCharacteristicNotificationsInit.clear();
         remainingConnectionInitializationSteps.addAll(Arrays.asList(ConnectionInitializationStep.values()));
         remainingConnectionInitializationSteps.remove(ConnectionInitializationStep.ALREADY_INITIALIZED);
         remainingCharacteristicNotificationsInit.addAll(CharacteristicUUID.ENABLED_NOTIFICATIONS);
+        mobiAuthorizationNotificationReady = false;
+        mobiPostBondNotificationsConfigured = false;
+    }
+
+    private boolean isMobi(BluetoothPeripheral peripheral) {
+        return peripheral.getName() != null && peripheral.getName().startsWith("Tandem Mobi");
+    }
+
+    private String bytesForLog(UUID characteristicUuid, byte[] value) {
+        return CharacteristicUUID.AUTHORIZATION_CHARACTERISTICS.equals(characteristicUuid)
+                ? "<redacted>"
+                : Hex.encodeHexString(value);
+    }
+
+    private UUID notificationServiceUuid(UUID characteristicUuid) {
+        if (CharacteristicUUID.SERVICE_CHANGED_CHARACTERISTICS.equals(characteristicUuid)) {
+            return ServiceUUID.GENERIC_ATTRIBUTE_SERVICE_UUID;
+        }
+        if (CharacteristicUUID.TDU_CONTROL_POINT_CHARACTERISTICS.equals(characteristicUuid)) {
+            return ServiceUUID.TDU_SERVICE_UUID;
+        }
+        return ServiceUUID.PUMP_SERVICE_UUID;
+    }
+
+    private void prepareNotificationTargets(BluetoothPeripheral peripheral) {
+        synchronized (remainingCharacteristicNotificationsInit) {
+            remainingCharacteristicNotificationsInit.clear();
+            if (isMobi(peripheral)) {
+                remainingCharacteristicNotificationsInit.add(CharacteristicUUID.AUTHORIZATION_CHARACTERISTICS);
+                remainingCharacteristicNotificationsInit.addAll(CharacteristicUUID.MOBI_POST_BOND_NOTIFICATIONS);
+            } else {
+                remainingCharacteristicNotificationsInit.addAll(CharacteristicUUID.ENABLED_NOTIFICATIONS);
+            }
+        }
+    }
+
+    private void enableNotifications(BluetoothPeripheral peripheral, Iterable<UUID> characteristicUuids) {
+        for (UUID uuid : characteristicUuids) {
+            UUID serviceUUID = notificationServiceUuid(uuid);
+            if (peripheral.getCharacteristic(serviceUUID, uuid) == null) {
+                Timber.w("Skipping setNotify for missing characteristic %s on this pump (firmware does not expose it)", CharacteristicUUID.which(uuid));
+                synchronized (remainingCharacteristicNotificationsInit) {
+                    remainingCharacteristicNotificationsInit.remove(uuid);
+                    if (remainingCharacteristicNotificationsInit.isEmpty()) {
+                        remainingConnectionInitializationSteps.remove(ConnectionInitializationStep.CHARACTERISTIC_NOTIFICATIONS);
+                    }
+                }
+                continue;
+            }
+            peripheral.setNotify(serviceUUID, uuid, true);
+        }
+    }
+
+    private synchronized void enableMobiPostBondNotificationsIfReady(BluetoothPeripheral peripheral) {
+        if (!isMobi(peripheral) || mobiPostBondNotificationsConfigured) {
+            return;
+        }
+        if (!mobiAuthorizationNotificationReady || peripheral.getBondState() != BondState.BONDED) {
+            Timber.i("Mobi notification initialization waiting (authorizationReady=%s, bondState=%s)",
+                    mobiAuthorizationNotificationReady, peripheral.getBondState());
+            return;
+        }
+
+        mobiPostBondNotificationsConfigured = true;
+        Timber.i("Mobi bond complete; enabling post-bond pump notifications in official-app order");
+        enableNotifications(peripheral, CharacteristicUUID.MOBI_POST_BOND_NOTIFICATIONS);
     }
 
     // Callback for peripheral-specific events
@@ -171,13 +257,13 @@ public class TandemBluetoothHandler {
         @Override
         public void onServicesDiscovered(@NotNull BluetoothPeripheral peripheral) {
             Timber.d("TandemBluetoothHandler: services discovered, updating BT state");
-            // Request a higher MTU, iOS always asks for 185
+            // The official Mobi app requests Android's maximum MTU (517); the captured pump
+            // negotiated 247. Keep the established 185 request for other Tandem models.
             // NOTE: If this is removed or lowered, then pump request messages cannot be over a certain length
             // or they may not be able to be received. More pump response messages will also split over multiple packets.
             // If setting the MTU returns an error, the pump is likely not accepting connections and needs to be open
             // to the pairing menu.
-            // TODO: the t:connect Android app sets a higher MTU of 240 on the connection
-            int mtu = 185;
+            int mtu = isMobi(peripheral) ? 517 : 185;
             Timber.d("TandemBluetoothHandler: current MTU %d", peripheral.getCurrentMtu());
             if (peripheral.getCurrentMtu() != mtu) {
                 peripheral.requestMtu(mtu);
@@ -207,23 +293,14 @@ public class TandemBluetoothHandler {
             // fired, so the entry would never be removed from remainingCharacteristicNotificationsInit
             // and the CHARACTERISTIC_NOTIFICATIONS gate would deadlock. Pre-flight here and skip
             // absent ones so initialization can complete on those firmwares.
-            CharacteristicUUID.ENABLED_NOTIFICATIONS.forEach(uuid -> {
-                UUID serviceUUID = ServiceUUID.PUMP_SERVICE_UUID;
-                if (CharacteristicUUID.SERVICE_CHANGED_CHARACTERISTICS.equals(uuid)) {
-                    serviceUUID = ServiceUUID.GENERIC_ATTRIBUTE_SERVICE_UUID;
-                }
-                if (peripheral.getCharacteristic(serviceUUID, uuid) == null) {
-                    Timber.w("Skipping setNotify for missing characteristic %s on this pump (firmware does not expose it)", CharacteristicUUID.which(uuid));
-                    synchronized (remainingCharacteristicNotificationsInit) {
-                        remainingCharacteristicNotificationsInit.remove(uuid);
-                        if (remainingCharacteristicNotificationsInit.isEmpty()) {
-                            remainingConnectionInitializationSteps.remove(ConnectionInitializationStep.CHARACTERISTIC_NOTIFICATIONS);
-                        }
-                    }
-                    return;
-                }
-                peripheral.setNotify(serviceUUID, uuid, true);
-            });
+            prepareNotificationTargets(peripheral);
+            if (isMobi(peripheral)) {
+                // Enabling AUTHORIZATION first triggers Android's secure LE pairing prompt. The
+                // remaining pump characteristics are intentionally deferred until BOND_BONDED.
+                enableNotifications(peripheral, Arrays.asList(CharacteristicUUID.AUTHORIZATION_CHARACTERISTICS));
+            } else {
+                enableNotifications(peripheral, CharacteristicUUID.ENABLED_NOTIFICATIONS);
+            }
 
             Timber.i("TandemBluetoothHandler: waiting for Bluetooth initialization callback");
             remainingConnectionInitializationSteps.remove(ConnectionInitializationStep.SERVICES_DISCOVERED);
@@ -346,6 +423,11 @@ public class TandemBluetoothHandler {
                         remainingConnectionInitializationSteps.remove(ConnectionInitializationStep.CHARACTERISTIC_NOTIFICATIONS);
                     }
                 }
+                if (isMobi(peripheral) &&
+                        CharacteristicUUID.AUTHORIZATION_CHARACTERISTICS.equals(characteristic.getUuid())) {
+                    mobiAuthorizationNotificationReady = true;
+                    enableMobiPostBondNotificationsIfReady(peripheral);
+                }
                 checkIfInitialPumpConnectionEstablished(peripheral);
 
             } else {
@@ -359,11 +441,28 @@ public class TandemBluetoothHandler {
         }
 
         @Override
+        public void onBondingStarted(@NotNull BluetoothPeripheral peripheral) {
+            Timber.i("Bluetooth bonding started for %s", peripheral.getName());
+        }
+
+        @Override
+        public void onBondingSucceeded(@NotNull BluetoothPeripheral peripheral) {
+            Timber.i("Bluetooth bonding succeeded for %s", peripheral.getName());
+            enableMobiPostBondNotificationsIfReady(peripheral);
+        }
+
+        @Override
+        public void onBondingFailed(@NotNull BluetoothPeripheral peripheral) {
+            Timber.w("Bluetooth bonding failed for %s", peripheral.getName());
+            tandemPump.onPairingPromptNotAcceptedYet(peripheral, 0);
+        }
+
+        @Override
         public void onCharacteristicWrite(@NotNull BluetoothPeripheral peripheral, @NotNull byte[] value, @NotNull BluetoothGattCharacteristic characteristic, @NotNull GattStatus status) {
             if (status == GattStatus.SUCCESS) {
-                Timber.d("SUCCESS: Writing <%s> to %s", asHexString(value), CharacteristicUUID.which(characteristic.getUuid()));
+                Timber.d("SUCCESS: Writing <%s> to %s", bytesForLog(characteristic.getUuid(), value), CharacteristicUUID.which(characteristic.getUuid()));
             } else {
-                Timber.e("ERROR: Failed writing <%s> to %s (%s)", asHexString(value), CharacteristicUUID.which(characteristic.getUuid()), status);
+                Timber.e("ERROR: Failed writing <%s> to %s (%s)", bytesForLog(characteristic.getUuid(), value), CharacteristicUUID.which(characteristic.getUuid()), status);
                 if (PumpState.tconnectAppConnectionSharing && CharacteristicUUID.AUTHORIZATION_CHARACTERISTICS.equals(characteristic.getUuid()) && status == GattStatus.ERROR) {
                     // When we receive an error on the authorization characteristic while t:connect app connection sharing is enabled,
                     // mark that we can ignore the authentication on the next connection since we trust the t:connect app will instead
@@ -381,7 +480,7 @@ public class TandemBluetoothHandler {
                 } else {
                     Timber.d("characteristic write error. tconnectAppConnectionSharing=" + PumpState.tconnectAppConnectionSharing + " tconnectAppConnectionSharingIgnoreInitialFailingWrite=" + PumpState.tconnectAppConnectionSharingIgnoreInitialFailingWrite);
                     tandemPump.onPumpCriticalError(peripheral,
-                            TandemError.CHARACTERISTIC_WRITE_FAILED.withExtra("characteristic: " + CharacteristicUUID.which(characteristic.getUuid()) + ", value: " + Hex.encodeHexString(value) + ", status: " + status));
+                            TandemError.CHARACTERISTIC_WRITE_FAILED.withExtra("characteristic: " + CharacteristicUUID.which(characteristic.getUuid()) + ", value: " + bytesForLog(characteristic.getUuid(), value) + ", status: " + status));
                 }
             }
         }
@@ -389,7 +488,7 @@ public class TandemBluetoothHandler {
         @Override
         public void onCharacteristicUpdate(@NotNull BluetoothPeripheral peripheral, @NotNull byte[] value, @NotNull BluetoothGattCharacteristic btCharacteristic, @NotNull GattStatus status) {
             if (status != GattStatus.SUCCESS) {
-                Timber.w("ERROR: Failed to receive update <%s> to %s (%s)", asHexString(value), CharacteristicUUID.which(btCharacteristic.getUuid()), status);
+                Timber.w("ERROR: Failed to receive update <%s> to %s (%s)", bytesForLog(btCharacteristic.getUuid(), value), CharacteristicUUID.which(btCharacteristic.getUuid()), status);
                 return;
             }
 
@@ -437,7 +536,7 @@ public class TandemBluetoothHandler {
 
                 Byte txId = BTResponseParser.parseTxId(value);
                 PumpState.processedResponseMessages++;
-                Timber.d("Received %s response, txId %d: %s (processedResponseMessages=%d)", uuidName, txId, Hex.encodeHexString(parser.getValue()), PumpState.processedResponseMessages);
+                Timber.d("Received %s response, txId %d: %s (processedResponseMessages=%d)", uuidName, txId, bytesForLog(characteristicUUID, parser.getValue()), PumpState.processedResponseMessages);
 
                 // Since we've already gotten at least this response, we can sync our opcodes.
                 // PumpState.tconnectAppConnectionSharingIgnoreInitialFailingWrite = false;
@@ -526,7 +625,7 @@ public class TandemBluetoothHandler {
                 try {
                     response = BTResponseParser.parse(wrapper.message(), packetArrayList, parser.getValue(), characteristicUUID);
                 } catch (UnexpectedTransactionIdException e) {
-                    Timber.w(e, "Unexpected transaction id in '%s': %s", Hex.encodeHexString(parser.getValue()), BTResponseParser.parseBestEffortForLogging(value, characteristicUUID));
+                    Timber.w(e, "Unexpected transaction id in '%s': %s", bytesForLog(characteristicUUID, parser.getValue()), BTResponseParser.parseBestEffortForLogging(value, characteristicUUID));
                     if (txId == 0 && e.foundTxId > 0) {
                         Timber.i("Ignoring txId %d since current txId is 0", e.foundTxId);
 //                        Timber.i("Setting txId from %d to %d, since initial txId was not 0", txId, e.foundTxId);
@@ -561,7 +660,7 @@ public class TandemBluetoothHandler {
 
                     return;
                 } catch (PacketArrayList.InvalidSignedMessageHMACSignatureException e) {
-                    Timber.e(e, "Unable to parse pump response message '%s'", Hex.encodeHexString(parser.getValue()));
+                    Timber.e(e, "Unable to parse pump response message '%s'", bytesForLog(characteristicUUID, parser.getValue()));
                     tandemPump.onPumpCriticalError(peripheral, TandemError.INVALID_SIGNED_HMAC_SIGNATURE.withExtra(
                             StringUtils.isBlank(PumpState.getPairingCodeCached()) ?
                                     "pairing code not specified" : "provided pairing code is likely invalid"
@@ -569,18 +668,21 @@ public class TandemBluetoothHandler {
                     return;
 
                 } catch (Exception e) {
-                    Timber.e(e, "Unable to parse pump response message '%s'", Hex.encodeHexString(parser.getValue()));
+                    Timber.e(e, "Unable to parse pump response message '%s'", bytesForLog(characteristicUUID, parser.getValue()));
                     tandemPump.onPumpCriticalError(
                             peripheral,
                             TandemError.UNPROCESSABLE_MESSAGE
-                                    .withExtra("raw bytes: " + Hex.encodeHexString(parser.getValue()))
+                                    .withExtra("raw bytes: " + bytesForLog(characteristicUUID, parser.getValue()))
                                     .withInitiatingMessage(requestMessage)
                     );
                     return;
                 }
 
                 PumpState.processedResponseMessagesFromUs++;
-                Timber.d("Processed %s response (%d): %s (%s) (%d processed total, %d from us)", characteristic, txId, response.message(), Hex.encodeHexString(parser.getValue()), PumpState.processedResponseMessages, PumpState.processedResponseMessagesFromUs);
+                String loggedResponse = CharacteristicUUID.AUTHORIZATION_CHARACTERISTICS.equals(characteristicUUID)
+                        ? response.message().map(m -> m.messageName() + "[payload=<redacted>]").orElse("<empty>")
+                        : response.message().toString();
+                Timber.d("Processed %s response (%d): %s (%s) (%d processed total, %d from us)", characteristic, txId, loggedResponse, bytesForLog(characteristicUUID, parser.getValue()), PumpState.processedResponseMessages, PumpState.processedResponseMessagesFromUs);
 
                 if (response.message().isPresent()) {
                     if (!characteristicUUID.equals(CharacteristicUUID.HISTORY_LOG_CHARACTERISTICS) &&
@@ -601,10 +703,10 @@ public class TandemBluetoothHandler {
                     }
                 } else {
                     if (packetArrayList.needsMorePacket()) {
-                        Timber.w("Couldn't process the response message for '%s' -- we likely need more packets. This should resolve when fetching the next BT packet.", Hex.encodeHexString(parser.getValue()));
+                        Timber.w("Couldn't process the response message for '%s' -- we likely need more packets. This should resolve when fetching the next BT packet.", bytesForLog(characteristicUUID, parser.getValue()));
                         PumpState.savePacketArrayList(characteristic, txId, packetArrayList);
                     } else {
-                        Timber.w("Dropping unprocessable complete response message for '%s' (txId=%d, characteristic=%s)", Hex.encodeHexString(parser.getValue()), txId, characteristic);
+                        Timber.w("Dropping unprocessable complete response message for '%s' (txId=%d, characteristic=%s)", bytesForLog(characteristicUUID, parser.getValue()), txId, characteristic);
                     }
                     return;
                 }
@@ -629,47 +731,47 @@ public class TandemBluetoothHandler {
                 // JPAKE
                 } else if (msg instanceof Jpake1aResponse) {
                     Jpake1aResponse resp = (Jpake1aResponse) response.message().get();
-                    Timber.d("JpakeAuthResp1a: %s", resp);
+                    Timber.d("JpakeAuthResp1a received (<redacted>)");
                     tandemPump.onJpakeProgress(JpakeAuthBuilder.getInstance().getStep());
                     JpakeAuthBuilder.getInstance().processResponse(msg);
 
                     Message req = JpakeAuthBuilder.getInstance().nextRequest();
-                    Timber.d("JpakeAuthReq1b: %s", req);
+                    Timber.d("JpakeAuthReq1b generated (<redacted>)");
                     tandemPump.onJpakeProgress(JpakeAuthBuilder.getInstance().getStep());
                     tandemPump.sendCommand(peripheral, req);
                 } else if (msg instanceof Jpake1bResponse) {
                     Jpake1bResponse resp = (Jpake1bResponse) response.message().get();
-                    Timber.d("JpakeAuthResp1b: %s", resp);
+                    Timber.d("JpakeAuthResp1b received (<redacted>)");
                     tandemPump.onJpakeProgress(JpakeAuthBuilder.getInstance().getStep());
                     JpakeAuthBuilder.getInstance().processResponse(msg);
 
                     Message req = JpakeAuthBuilder.getInstance().nextRequest();
                     tandemPump.onJpakeProgress(JpakeAuthBuilder.getInstance().getStep());
-                    Timber.d("JpakeAuthReq2: %s", req);
+                    Timber.d("JpakeAuthReq2 generated (<redacted>)");
                     tandemPump.sendCommand(peripheral, req);
                 } else if (msg instanceof Jpake2Response) {
                     Jpake2Response resp = (Jpake2Response) response.message().get();
-                    Timber.d("JpakeAuthResp2: %s", resp);
+                    Timber.d("JpakeAuthResp2 received (<redacted>)");
                     tandemPump.onJpakeProgress(JpakeAuthBuilder.getInstance().getStep());
                     JpakeAuthBuilder.getInstance().processResponse(msg);
 
                     Message req = JpakeAuthBuilder.getInstance().nextRequest();
-                    Timber.d("JpakeAuthReq3: %s", req);
+                    Timber.d("JpakeAuthReq3 generated (<redacted>)");
                     tandemPump.onJpakeProgress(JpakeAuthBuilder.getInstance().getStep());
                     tandemPump.sendCommand(peripheral, req);
                 } else if (msg instanceof Jpake3SessionKeyResponse) {
                     Jpake3SessionKeyResponse resp = (Jpake3SessionKeyResponse) response.message().get();
-                    Timber.d("JpakeAuthResp3: %s", resp);
+                    Timber.d("JpakeAuthResp3 received (<redacted>)");
                     tandemPump.onJpakeProgress(JpakeAuthBuilder.getInstance().getStep());
                     JpakeAuthBuilder.getInstance().processResponse(msg);
 
                     Message req = JpakeAuthBuilder.getInstance().nextRequest();
-                    Timber.d("JpakeAuthReq4: %s", req);
+                    Timber.d("JpakeAuthReq4 generated (<redacted>)");
                     tandemPump.onJpakeProgress(JpakeAuthBuilder.getInstance().getStep());
                     tandemPump.sendCommand(peripheral, req);
                 } else if (msg instanceof Jpake4KeyConfirmationResponse) {
                     Jpake4KeyConfirmationResponse resp = (Jpake4KeyConfirmationResponse) response.message().get();
-                    Timber.d("JpakeAuthResp4: %s", resp);
+                    Timber.d("JpakeAuthResp4 received (<redacted>)");
                     tandemPump.onJpakeProgress(JpakeAuthBuilder.getInstance().getStep());
                     JpakeAuthBuilder.getInstance().processResponse(msg);
 
@@ -704,7 +806,7 @@ public class TandemBluetoothHandler {
                     tandemPump.onReceiveMessage(peripheral, msg);
                 }
             } else {
-                Timber.w("UNHANDLED RESPONSE to %s: %s", CharacteristicUUID.which(characteristicUUID), Hex.encodeHexString(parser.getValue()));
+                Timber.w("UNHANDLED RESPONSE to %s: %s", CharacteristicUUID.which(characteristicUUID), bytesForLog(characteristicUUID, parser.getValue()));
             }
         }
 
@@ -787,6 +889,97 @@ public class TandemBluetoothHandler {
 
     private final int defaultInitialDisconnectRetryMaxCount = 3;
     private final long defaultInitialDisconnectRetryWindowMs = 120_000L;
+    private final long defaultInitialAuthNoReplyRecoveryDelayMs = 15_000L;
+
+    static boolean shouldPauseInitialAuthNoReplyRetries(
+            int failuresInWindow,
+            int maxRetryCount,
+            boolean continueAfterQuickRetryLimit) {
+        return failuresInWindow >= maxRetryCount && !continueAfterQuickRetryLimit;
+    }
+
+    static long initialAuthNoReplyReconnectDelayMs(
+            int failuresInWindow,
+            int maxRetryCount,
+            boolean continueAfterQuickRetryLimit,
+            long quickRetryDelayMs,
+            long recoveryDelayMs) {
+        if (failuresInWindow >= maxRetryCount && continueAfterQuickRetryLimit) {
+            return Math.max(quickRetryDelayMs, recoveryDelayMs);
+        }
+        return quickRetryDelayMs;
+    }
+
+    static long nextReconnectDelayMs(long currentDelayMs) {
+        long boundedCurrent = Math.min(
+                MAX_RECONNECT_DELAY_MS,
+                Math.max(MIN_RECONNECT_DELAY_MS, currentDelayMs));
+        return Math.min(MAX_RECONNECT_DELAY_MS, boundedCurrent + (boundedCurrent / 2L));
+    }
+
+    static boolean isEstablishedPumpReconnectEligible(
+            BondState bondState,
+            @Nullable String savedBluetoothMac,
+            @Nullable String peripheralAddress) {
+        return bondState == BondState.BONDED &&
+                StringUtils.isNotBlank(savedBluetoothMac) &&
+                StringUtils.equalsIgnoreCase(savedBluetoothMac, peripheralAddress);
+    }
+
+    static boolean isConnectionAttemptStale(
+            long attemptStartedAtMs,
+            long nowMs,
+            long staleAfterMs) {
+        return attemptStartedAtMs > 0L &&
+                nowMs >= attemptStartedAtMs &&
+                nowMs - attemptStartedAtMs >= staleAfterMs;
+    }
+
+    private synchronized void markConnectionAttempt(BluetoothPeripheral peripheral) {
+        connectionAttemptPeripheral = peripheral;
+        connectionAttemptStartedAtMs = android.os.SystemClock.elapsedRealtime();
+    }
+
+    private synchronized void clearConnectionAttempt() {
+        connectionAttemptPeripheral = null;
+        connectionAttemptStartedAtMs = 0L;
+    }
+
+    private synchronized void resetReconnectBackoff() {
+        reconnectDelayMs = MIN_RECONNECT_DELAY_MS;
+    }
+
+    private synchronized long currentReconnectDelayMs() {
+        return reconnectDelayMs;
+    }
+
+    private synchronized void advanceReconnectBackoff() {
+        reconnectDelayMs = nextReconnectDelayMs(reconnectDelayMs);
+    }
+
+    private void cancelScheduledReconnect() {
+        synchronized (this) {
+            reconnectScheduled = false;
+        }
+        handler.removeCallbacks(reconnectRunnable);
+    }
+
+    private void scheduleReconnect(long delayMs, String reason) {
+        long boundedDelayMs = Math.max(0L, Math.min(MAX_RECONNECT_DELAY_MS, delayMs));
+        synchronized (this) {
+            if (stopped) {
+                Timber.i("Reconnect not scheduled because handler is stopped (reason=%s)", reason);
+                return;
+            }
+            if (reconnectScheduled) {
+                Timber.d("Reconnect already scheduled; coalescing request (reason=%s)", reason);
+                return;
+            }
+            reconnectScheduled = true;
+        }
+        Timber.i("Reconnect scheduled in %d ms (reason=%s)", boundedDelayMs, reason);
+        handler.postDelayed(reconnectRunnable, boundedDelayMs);
+    }
 
     private synchronized void markPendingInitialDisconnectReason(InitialDisconnectReason reason) {
         pendingInitialDisconnectReason = reason;
@@ -824,18 +1017,37 @@ public class TandemBluetoothHandler {
             Timber.i("TandemBluetoothHandler: connected to '%s'", peripheral.getName());
             PumpState.clearInitialConnectionHardAuthFailure();
             PumpState.resetInitialConnectionNoReplyFailures();
-            this.reconnectDelay = 250;
+            clearConnectionAttempt();
+            cancelScheduledReconnect();
+            resetReconnectBackoff();
         }
 
         @Override
         public void onConnectionFailed(@NotNull BluetoothPeripheral peripheral, final @NotNull HciStatus status) {
             Timber.e("TandemBluetoothHandler: connection '%s' failed with status %s", peripheral.getName(), status);
 
+            clearConnectionAttempt();
+            resetRemainingConnectionInitializationSteps();
+
             tandemPump.onPumpCriticalError(peripheral,
                     TandemError.BT_CONNECTION_FAILED.withExtra("status: " + status));
-        }
 
-        private int reconnectDelay = 250;
+            String savedBluetoothMac = PumpState.getSavedBluetoothMAC(context);
+            if (isEstablishedPumpReconnectEligible(
+                    peripheral.getBondState(),
+                    savedBluetoothMac,
+                    peripheral.getAddress())) {
+                long delayMs = currentReconnectDelayMs();
+                scheduleReconnect(delayMs, "established pump connection failed: " + status);
+                advanceReconnectBackoff();
+            } else {
+                Timber.w(
+                        "Connection failure will not auto-retry because this is not an established saved pump " +
+                                "(bondState=%s, savedMacMatch=%s)",
+                        peripheral.getBondState(),
+                        StringUtils.equalsIgnoreCase(savedBluetoothMac, peripheral.getAddress()));
+            }
+        }
 
         @Override
         public void onDisconnectedPeripheral(@NotNull final BluetoothPeripheral peripheral, final @NotNull HciStatus status) {
@@ -852,7 +1064,10 @@ public class TandemBluetoothHandler {
                 disconnectReason = InitialDisconnectReason.PAIRING_INCOMPLETE_OR_MISSED_PROMPT;
             }
 
+            long reconnectDelay = currentReconnectDelayMs();
             Timber.i("TandemBluetoothHandler: disconnected '%s' with status %s (reconnectDelay: %d ms reason=%s)", peripheral.getName(), status, reconnectDelay, disconnectReason);
+            clearConnectionAttempt();
+            scanActive = false;
             PumpState.clearRequestMessages();
             Packetize.txId.reset();
             resetRemainingConnectionInitializationSteps();
@@ -870,19 +1085,48 @@ public class TandemBluetoothHandler {
             if (disconnectReason == InitialDisconnectReason.INITIAL_AUTH_NO_REPLY) {
                 int failuresInWindow = recordRecentInitialDisconnectFailure();
                 int maxRetryCount = tandemPump.config.getInitialDisconnectRetryMaxCount().orElse(defaultInitialDisconnectRetryMaxCount);
-                if (failuresInWindow >= maxRetryCount) {
+                boolean continueAfterQuickRetryLimit = tandemPump.config
+                        .getContinueInitialAuthNoReplyRetries()
+                        .orElse(false);
+                if (shouldPauseInitialAuthNoReplyRetries(
+                        failuresInWindow,
+                        maxRetryCount,
+                        continueAfterQuickRetryLimit)) {
                     Timber.w("ReconnectPaused event=initial_auth_no_reply action=manual_reinit_required failuresInWindow=%d maxRetryCount=%d", failuresInWindow, maxRetryCount);
                     tandemPump.onPairingPromptNotAcceptedYet(peripheral, failuresInWindow);
                     return;
                 }
-                Timber.w("ReconnectBackoff event=initial_auth_no_reply action=retry failuresInWindow=%d maxRetryCount=%d", failuresInWindow, maxRetryCount);
+                long recoveryDelayMs = tandemPump.config
+                        .getInitialAuthNoReplyRecoveryDelayMs()
+                        .orElse(defaultInitialAuthNoReplyRecoveryDelayMs);
+                reconnectDelay = initialAuthNoReplyReconnectDelayMs(
+                        failuresInWindow,
+                        maxRetryCount,
+                        continueAfterQuickRetryLimit,
+                        reconnectDelay,
+                        recoveryDelayMs);
+                if (failuresInWindow >= maxRetryCount) {
+                    Timber.w("ReconnectDeferred event=initial_auth_no_reply action=background_recovery_retry failuresInWindow=%d maxRetryCount=%d delayMs=%d", failuresInWindow, maxRetryCount, reconnectDelay);
+                } else {
+                    Timber.w("ReconnectBackoff event=initial_auth_no_reply action=retry failuresInWindow=%d maxRetryCount=%d", failuresInWindow, maxRetryCount);
+                }
             }
 
             if (tandemPump.onPumpDisconnected(peripheral, status)) {
-                Timber.d("TandemBluetoothHandler: scheduling immediateConnectToPeripheral in %d ms", reconnectDelay);
-                // Reconnect to this device when it becomes available again
-                handler.postDelayed(TandemBluetoothHandler.this::immediateConnectToPeripheral, reconnectDelay);
-                reconnectDelay *= 1.5;
+                String savedBluetoothMac = PumpState.getSavedBluetoothMAC(context);
+                if (isEstablishedPumpReconnectEligible(
+                        peripheral.getBondState(),
+                        savedBluetoothMac,
+                        peripheral.getAddress())) {
+                    scheduleReconnect(reconnectDelay, "established pump disconnected: " + status);
+                } else {
+                    // Preserve the existing initial-auth retry path. The Phase 01U single-flight
+                    // policy is intentionally limited to a previously authenticated saved pump.
+                    handler.postDelayed(TandemBluetoothHandler.this::immediateConnectToPeripheral, reconnectDelay);
+                }
+                synchronized (TandemBluetoothHandler.this) {
+                    reconnectDelayMs = nextReconnectDelayMs(reconnectDelay);
+                }
             }
         }
 
@@ -905,7 +1149,9 @@ public class TandemBluetoothHandler {
             if (tandemPump.onPumpDiscovered(peripheral, scanResult, readyState)) {
                 Timber.i("TandemBluetoothHandler: stopping scan in preparation for pump peripheral connection");
                 central.stopScan();
+                scanActive = false;
                 Timber.i("PUMP-CONNECT(%s): addr=%s connState=%s bondState=%s", peripheral.getName(), peripheral.getAddress(), peripheral.getState(), peripheral.getBondState());
+                markConnectionAttempt(peripheral);
                 central.connectPeripheral(peripheral, peripheralCallback);
             }
         }
@@ -923,6 +1169,12 @@ public class TandemBluetoothHandler {
         @Override
         public void onScanFailed(@NotNull ScanFailure scanFailure) {
             Timber.w("TandemBluetoothHandler: scanning failed with error %s", scanFailure);
+            scanActive = false;
+            if (StringUtils.isNotBlank(PumpState.getSavedBluetoothMAC(context))) {
+                long delayMs = currentReconnectDelayMs();
+                scheduleReconnect(delayMs, "scan failed: " + scanFailure);
+                advanceReconnectBackoff();
+            }
         }
     };
 
@@ -968,34 +1220,143 @@ public class TandemBluetoothHandler {
     }
 
     private void immediateConnectToPeripheral() {
+        synchronized (this) {
+            if (stopped) {
+                Timber.i("TandemBluetoothHandler: skipping connect because handler is stopped");
+                return;
+            }
+        }
         Timber.d("TandemBluetoothHandler: running immediateConnectToPeripheral");
         Optional<BluetoothPeripheral> alreadyBondedPump = getAlreadyBondedPump();
         if (alreadyBondedPump.isPresent()) {
             BluetoothPeripheral peripheral = alreadyBondedPump.get();
             Timber.i("TandemBluetoothHandler: Already bonded to Tandem peripheral: %s (%s)", peripheral.getName(), peripheral.getAddress());
             if (tandemPump.onPumpDiscovered(peripheral, null, PumpReadyState.UNKNOWN)) {
+                ConnectionState state = peripheral.getState();
+                if (state == ConnectionState.CONNECTED || state == ConnectionState.CONNECTING) {
+                    Timber.i("TandemBluetoothHandler: bonded pump already %s; no duplicate connect", state);
+                    return;
+                }
+                markConnectionAttempt(peripheral);
                 central.autoConnectPeripheral(peripheral, peripheralCallback);
                 return;
             } else {
                 Timber.i("TandemBluetoothHandler: onPumpDiscovered callback said to skip bonded pump %s", peripheral);
             }
         }
+        synchronized (this) {
+            if (scanActive) {
+                Timber.d("TandemBluetoothHandler: scan already active; no duplicate scan");
+                return;
+            }
+            scanActive = true;
+        }
         Timber.i("TandemBluetoothHandler: Scanning for all Tandem peripherals");
         central.scanForPeripheralsWithServices(new UUID[]{ServiceUUID.PUMP_SERVICE_UUID});
     }
 
+    /**
+     * Idempotently makes sure an established pump has an active scan or connection attempt.
+     * A foreground request may replace a genuinely stale GATT attempt; it never resends a pump
+     * command and it never changes pairing credentials or Android bond state.
+     */
+    public void ensureConnectionActive(boolean foregroundRequest) {
+        handler.post(() -> ensureConnectionActiveInternal(foregroundRequest, "client ensure request"));
+    }
+
+    public void ensureConnectionActive() {
+        ensureConnectionActive(false);
+    }
+
+    private void ensureConnectionActiveInternal(boolean foregroundRequest, String reason) {
+        synchronized (this) {
+            if (stopped) {
+                Timber.i("ensureConnectionActive ignored because handler is stopped");
+                return;
+            }
+        }
+
+        Optional<BluetoothPeripheral> alreadyBondedPump = getAlreadyBondedPump();
+        if (alreadyBondedPump.isPresent()) {
+            BluetoothPeripheral peripheral = alreadyBondedPump.get();
+            ConnectionState state = peripheral.getState();
+            if (state == ConnectionState.CONNECTED) {
+                Timber.d("ensureConnectionActive: pump is already connected");
+                return;
+            }
+
+            long attemptStartedAtMs;
+            BluetoothPeripheral attemptPeripheral;
+            synchronized (this) {
+                attemptStartedAtMs = connectionAttemptStartedAtMs;
+                attemptPeripheral = connectionAttemptPeripheral;
+            }
+            boolean sameAttempt = attemptPeripheral != null &&
+                    StringUtils.equalsIgnoreCase(attemptPeripheral.getAddress(), peripheral.getAddress());
+            long staleAfterMs = foregroundRequest
+                    ? FOREGROUND_STALE_CONNECTION_MS
+                    : BACKGROUND_STALE_CONNECTION_MS;
+            boolean staleAttempt = sameAttempt && isConnectionAttemptStale(
+                    attemptStartedAtMs,
+                    android.os.SystemClock.elapsedRealtime(),
+                    staleAfterMs);
+
+            if (sameAttempt && !staleAttempt) {
+                Timber.d("ensureConnectionActive: connection attempt already active (state=%s)", state);
+                return;
+            }
+            if (staleAttempt) {
+                Timber.w(
+                        "ensureConnectionActive: replacing stale %s connection attempt after %d ms (%s)",
+                        foregroundRequest ? "foreground" : "background",
+                        android.os.SystemClock.elapsedRealtime() - attemptStartedAtMs,
+                        reason);
+                clearConnectionAttempt();
+                try {
+                    peripheral.cancelConnection();
+                } catch (Throwable t) {
+                    Timber.w(t, "Unable to cancel stale pump connection attempt");
+                }
+                scheduleReconnect(STALE_CONNECTION_RESTART_DELAY_MS, "stale connection attempt");
+                return;
+            }
+            if (state == ConnectionState.CONNECTING) {
+                markConnectionAttempt(peripheral);
+                Timber.d("ensureConnectionActive: adopting existing connecting peripheral");
+                return;
+            }
+            if (state == ConnectionState.DISCONNECTING) {
+                scheduleReconnect(STALE_CONNECTION_RESTART_DELAY_MS, "peripheral still disconnecting");
+                return;
+            }
+        }
+
+        Timber.i("ensureConnectionActive: re-arming pump discovery (%s)", reason);
+        immediateConnectToPeripheral();
+    }
+
     public void startScan() {
         Timber.i("TandemBluetoothHandler: startScan");
+        synchronized (this) {
+            stopped = false;
+        }
         synchronized (pumpReadyStateByAddress) {
             pumpReadyStateByAddress.clear();
         }
         // Scan for peripherals with a certain service UUIDs
         central.startPairingPopupHack();
 
-        handler.postDelayed(this::immediateConnectToPeripheral, 1000);
+        scheduleReconnect(1_000L, "start scan");
     }
 
     public void stop() {
+        synchronized (this) {
+            stopped = true;
+            reconnectScheduled = false;
+            scanActive = false;
+        }
+        clearConnectionAttempt();
+        handler.removeCallbacks(reconnectRunnable);
         central.stopScan();
         central.close();
     }

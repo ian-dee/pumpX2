@@ -223,8 +223,7 @@ public class IDPManager {
             if (profile.isPresent()) {
                 profile.get().processMessage(message);
             } else {
-                int activeSlot = profileStatusResponse.getActiveIdpSlotId();
-                int activeIdpId = profileStatusResponse.getIdpSlotIds().get(activeSlot);
+                int activeIdpId = profileStatusResponse.getActiveIdpSlotId();
                 boolean isActiveProfile = idpId == activeIdpId;
                 int slotIndex = profileStatusResponse.getIdpSlotIds().indexOf(idpId);
                 profiles.add(new Profile((IDPSettingsResponse) message, isActiveProfile, slotIndex));
@@ -256,8 +255,7 @@ public class IDPManager {
 
     public Profile getActiveProfile() {
         Validate.isTrue(isComplete());
-        int activeSlot = profileStatusResponse.getActiveIdpSlotId();
-        int activeIdpId = profileStatusResponse.getIdpSlotIds().get(activeSlot);
+        int activeIdpId = profileStatusResponse.getActiveIdpSlotId();
         return getProfileWithIdpId(activeIdpId).orElseThrow();
     }
 

@@ -155,7 +155,10 @@ public abstract class TandemPump {
         byte currentTxId = Packetize.txId.get();
         PumpState.pushRequestMessage(message, currentTxId);
         // added spaces align the message with the corresponding PARSED-MESSAGE canonical log line
-        Timber.i("  SENT-MESSAGE(txId=%-3d, %s):\t%s", currentTxId, CharacteristicUUID.which(message.getCharacteristic().getUuid()), message);
+        String loggedMessage = message.getCharacteristic() == com.jwoglom.pumpx2.pump.messages.bluetooth.Characteristic.AUTHORIZATION
+                ? message.messageName() + "[payload=<redacted>]"
+                : message.toString();
+        Timber.i("  SENT-MESSAGE(txId=%-3d, %s):\t%s", currentTxId, CharacteristicUUID.which(message.getCharacteristic().getUuid()), loggedMessage);
         TronMessageWrapper wrapper = new TronMessageWrapper(message, currentTxId);
         Packetize.txId.increment();
 
@@ -166,7 +169,10 @@ public abstract class TandemPump {
         for (byte[] b : bytes) {
             UUID uuid = CharacteristicUUID.determine(message);
             // added spaces align the message with the corresponding PARSED-MESSAGE canonical log line
-            Timber.d(" SENT-RAW-CHAR(txId=%-3d, %s):\t%s", currentTxId, CharacteristicUUID.which(uuid), Hex.encodeHexString(b));
+            String loggedBytes = CharacteristicUUID.AUTHORIZATION_CHARACTERISTICS.equals(uuid)
+                    ? "<redacted>"
+                    : Hex.encodeHexString(b);
+            Timber.d(" SENT-RAW-CHAR(txId=%-3d, %s):\t%s", currentTxId, CharacteristicUUID.which(uuid), loggedBytes);
             peripheral.writeCharacteristic(ServiceUUID.PUMP_SERVICE_UUID,
                     uuid,
                     b,
@@ -259,8 +265,9 @@ public abstract class TandemPump {
         Timber.i("TandemPump: onPumpConnected");
 
         // hack: ensure cached in PumpState.
-        Timber.i("JpakeDerivedSecret=%s", PumpState.getJpakeDerivedSecret(context));
-        Timber.i("JpakeServerNonce=%s", PumpState.getJpakeServerNonce(context));
+        Timber.i("JPAKE credentials loaded (derivedSecretPresent=%s, serverNoncePresent=%s)",
+                StringUtils.isNotBlank(PumpState.getJpakeDerivedSecret(context)),
+                StringUtils.isNotBlank(PumpState.getJpakeServerNonce(context)));
 
         sendCommand(peripheral, new ApiVersionRequest());
         sendCommand(peripheral, new PumpVersionRequest());
@@ -304,12 +311,12 @@ public abstract class TandemPump {
             PumpState.setJpakeServerNonce(context, "");
             PumpState.setPairingCode(context, pairingCode);
             if (StringUtils.isBlank(jpakeSecretHex)) {
-                Timber.i("PUMP-PAIR(SHORT_6CHAR, BOOTSTRAP, pairingCode=" + pairingCode + ")");
+                Timber.i("PUMP-PAIR(SHORT_6CHAR, BOOTSTRAP, pairingCode=<redacted>)");
                 JpakeAuthBuilder.clearInstance();
                 Message message = JpakeAuthBuilder.initializeWithPairingCode(pairingCode).nextRequest();
                 sendCommand(peripheral, message);
             } else {
-                Timber.i("PUMP-PAIR(SHORT_6CHAR, CONFIRM, pairingCode=" + pairingCode + ", derivedSecret=" + jpakeSecretHex + ")");
+                Timber.i("PUMP-PAIR(SHORT_6CHAR, CONFIRM, credentials=<redacted>)");
                 JpakeAuthBuilder.clearInstance();
                 try {
                     Message message = JpakeAuthBuilder.initializeWithDerivedSecret(pairingCode, Hex.decodeHex(jpakeSecretHex)).nextRequest();
@@ -321,7 +328,7 @@ public abstract class TandemPump {
                 }
             }
         } else if (PumpState.pairingCodeType == PairingCodeType.LONG_16CHAR) {
-            Timber.i("PUMP-PAIR(LONG_16CHAR, " + pairingCode + ")");
+            Timber.i("PUMP-PAIR(LONG_16CHAR, pairingCode=<redacted>)");
             try {
                 PumpState.setPairingCode(context, pairingCode);
                 Message message = PumpChallengeRequestBuilder.create(centralChallenge, pairingCode);

@@ -6,7 +6,6 @@ import com.jwoglom.pumpx2.pump.messages.bluetooth.models.Packet;
 import com.jwoglom.pumpx2.pump.messages.helpers.Bytes;
 import com.jwoglom.pumpx2.shared.L;
 
-import com.jwoglom.pumpx2.shared.Hex;
 import org.apache.commons.codec.digest.HmacAlgorithms;
 import org.apache.commons.codec.digest.HmacUtils;
 import org.apache.commons.lang3.ArrayUtils;
@@ -43,7 +42,7 @@ public class Packetize {
             L.e(TAG, "packetize has null message");
         } else if (message.getCargo() == null) {
             L.e(TAG, "packetize has null messagecargo messageName="+message.messageName());
-            L.e(TAG, "packetize has null messagecargo message="+message+" authKey="+Hex.encodeHexString(authenticationKey));
+            L.e(TAG, "packetize has null messagecargo message="+message+" authKey=<redacted>");
         }
         int length = 3 + message.getCargo().length;
         if (message.signed()) {
@@ -68,7 +67,7 @@ public class Packetize {
             byte[] timeSinceReset = Bytes.toUint32(pumpStateTimeSinceReset);
             System.arraycopy(timeSinceReset, 0, messageData, length - 24, 4);
 
-            L.d(TAG, "using authenticationKey=" + Hex.encodeHexString(authenticationKey) + " pumpTimeSinceReset=" + pumpStateTimeSinceReset);
+            L.d(TAG, "using authenticationKey=<redacted> pumpTimeSinceReset=" + pumpStateTimeSinceReset);
 
             byte[] hmacSha1Output = doHmacSha1(messageData, authenticationKey);
             System.arraycopy(messageData, 0, packet, 0, i);

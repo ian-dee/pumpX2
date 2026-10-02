@@ -1,6 +1,5 @@
 package com.jwoglom.pumpx2.pump.messages.bluetooth;
 
-import org.apache.commons.lang3.StringUtils;
 import com.jwoglom.pumpx2.pump.messages.builders.crypto.Hkdf;
 import com.jwoglom.pumpx2.pump.messages.models.ApiVersion;
 import com.jwoglom.pumpx2.shared.Hex;
@@ -46,16 +45,11 @@ public class PumpStateSupplier {
 
                 // hkdf of nonce and secret bytes are passed to hmac
                 byte[] authKey = Hkdf.build(jpakeNonce, jpakeSecret);
-                L.d(TAG, "DETERMINE-PUMP-AUTH-KEY-LINE PUMP_AUTHENTICATION_KEY=" + Hex.encodeHexString(authKey) + " PUMP_JPAKE_DERIVED_SECRET=" + derivedSecret + " PUMP_JPAKE_SERVER_NONCE=" + serverNonce);
-
                 return authKey;
             } catch (DecoderException e) {
                 L.e(TAG, e);
             }
         }
-
-        L.d(TAG, "DETERMINE-PUMP-AUTH-KEY-LINE PUMP_AUTHENTICATION_KEY=" + code + " PUMP_JPAKE=NULL");
-
 
         if (code == null) return new byte[0];
 

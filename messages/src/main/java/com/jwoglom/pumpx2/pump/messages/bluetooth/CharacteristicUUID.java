@@ -62,6 +62,19 @@ public class CharacteristicUUID {
             SERVICE_CHANGED_CHARACTERISTICS
     );
 
+    /**
+     * Notification order observed during a fresh official Tandem Mobi onboarding. Authorization
+     * is enabled first so Android can complete its secure LE bond; these are enabled afterwards.
+     */
+    public static final List<UUID> MOBI_POST_BOND_NOTIFICATIONS = Arrays.asList(
+            CURRENT_STATUS_CHARACTERISTICS,
+            HISTORY_LOG_CHARACTERISTICS,
+            QUALIFYING_EVENTS_CHARACTERISTICS,
+            CONTROL_STREAM_CHARACTERISTICS,
+            CONTROL_CHARACTERISTICS,
+            TDU_CONTROL_POINT_CHARACTERISTICS
+    );
+
     public static UUID determine(Message message) {
         if (message.getCharacteristic() == Characteristic.AUTHORIZATION) {
             return AUTHORIZATION_CHARACTERISTICS;

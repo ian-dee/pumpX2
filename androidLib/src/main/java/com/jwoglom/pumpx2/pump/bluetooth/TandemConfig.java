@@ -25,6 +25,15 @@ public class TandemConfig {
      * Rolling time window (milliseconds) used for {@link #initialDisconnectRetryMaxCount}.
      */
     private Optional<Long> initialDisconnectRetryWindowMs = Optional.empty();
+    /**
+     * Continue reconnecting after {@link #initialDisconnectRetryMaxCount} authentication/no-reply
+     * disconnects instead of reporting a missed pairing prompt and pausing indefinitely.
+     */
+    private Optional<Boolean> continueInitialAuthNoReplyRetries = Optional.empty();
+    /**
+     * Cooldown (milliseconds) between recovery retries after the quick-retry limit is reached.
+     */
+    private Optional<Long> initialAuthNoReplyRecoveryDelayMs = Optional.empty();
 
     public TandemConfig() {}
 
@@ -58,6 +67,16 @@ public class TandemConfig {
         return this;
     }
 
+    public TandemConfig withContinueInitialAuthNoReplyRetries(Boolean continueInitialAuthNoReplyRetries) {
+        this.continueInitialAuthNoReplyRetries = Optional.ofNullable(continueInitialAuthNoReplyRetries);
+        return this;
+    }
+
+    public TandemConfig withInitialAuthNoReplyRecoveryDelayMs(Long initialAuthNoReplyRecoveryDelayMs) {
+        this.initialAuthNoReplyRecoveryDelayMs = Optional.ofNullable(initialAuthNoReplyRecoveryDelayMs);
+        return this;
+    }
+
     public Optional<PairingCodeType> getPairingCodeType() {
         return pairingCodeType;
     }
@@ -79,5 +98,13 @@ public class TandemConfig {
 
     public Optional<Long> getInitialDisconnectRetryWindowMs() {
         return initialDisconnectRetryWindowMs;
+    }
+
+    public Optional<Boolean> getContinueInitialAuthNoReplyRetries() {
+        return continueInitialAuthNoReplyRetries;
+    }
+
+    public Optional<Long> getInitialAuthNoReplyRecoveryDelayMs() {
+        return initialAuthNoReplyRecoveryDelayMs;
     }
 }
